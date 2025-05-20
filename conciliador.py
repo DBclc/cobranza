@@ -1,6 +1,5 @@
 import pandas as pd
 from io import BytesIO
-from datetime import datetime, timedelta
 
 def procesar_conciliacion_completa(excel_file):
     xls = pd.ExcelFile(excel_file)
@@ -11,42 +10,66 @@ def procesar_conciliacion_completa(excel_file):
     comp_ingresos = pd.read_excel(xls, sheet_name='COMPLEMENTOS INGRESOS XML')
     comp_egresos = pd.read_excel(xls, sheet_name='COMPLEMENTOS EGRESOS XML')
 
-    conciliado = []
-
-    # Simplificación: convertir fechas
-    bancos['FECHA'] = pd.to_datetime(bancos['FECHA'], errors='coerce')
+    bancos['fecha'] = pd.to_datetime(bancos['fecha'], errors='coerce')
     comp_ingresos['FechaPago'] = pd.to_datetime(comp_ingresos['FechaPago'], errors='coerce')
+    comp_egresos['FechaPago'] = pd.to_datetime(comp_egresos['FechaPago'], errors='coerce')
 
-    # Ejemplo: agrupar complementos por UUID
-    comp_grouped = comp_ingresos.groupby('UUID')
-    for uuid, grupo in comp_grouped:
+    conciliado_ingresos = []
+    conciliado_egresos = []
+
+    # INGRESOS - Agrupación por UUID
+    for uuid, grupo in comp_ingresos.groupby('UUID'):
         fecha_pago = grupo['FechaPago'].iloc[0]
         monto_pagado = grupo['ImpPagado'].sum()
         folios = grupo['folio relacionado'].dropna().unique()
         receptor = grupo['Nombre Receptor'].iloc[0]
 
-        # Buscar abonos bancarios en ventana de 2 meses desde fecha de pago
         ventana = bancos[
-            (bancos['FECHA'] >= fecha_pago) & 
-            (bancos['FECHA'] <= fecha_pago + pd.DateOffset(months=2)) & 
-            (bancos['CARGO'].isna())
+            (bancos['fecha'] >= fecha_pago) &
+            (bancos['fecha'] <= fecha_pago + pd.DateOffset(months=2)) &
+            (bancos['cargos'].isna())
         ]
-
-        # Buscar combinaciones que sumen al ImpPagado (simplificado aquí por igualdad directa)
-        match = ventana[ventana['ABONO'].round(2) == round(monto_pagado, 2)]
+        match = ventana[ventana['abonos'].round(2) == round(monto_pagado, 2)]
         if not match.empty:
-            conciliado.append({
+            conciliado_ingresos.append({
+                'Tipo': 'Ingreso',
                 'UUID': uuid,
                 'Fecha Pago': fecha_pago.date(),
                 'Monto Complemento': monto_pagado,
                 'Folio Relacionado': ', '.join(folios),
-                'Receptor': receptor,
+                'Nombre Receptor': receptor,
                 'Movimientos Conciliados': len(match),
-                'Monto Conciliado': match['ABONO'].sum()
+                'Monto Conciliado': match['abonos'].sum()
             })
 
-    # Exportar a Excel
-    df_conciliado = pd.DataFrame(conciliado)
+    # EGRESOS - Agrupación por UUID
+    for uuid, grupo in comp_egresos.groupby('UUID'):
+        fecha_pago = grupo['FechaPago'].iloc[0]
+        monto_pagado = grupo['ImpPagado'].sum()
+        folios = grupo['FolioRel'].dropna().unique()
+        emisor = grupo['Nombre Emisor'].iloc[0]
+
+        ventana = bancos[
+            (bancos['fecha'] >= fecha_pago) &
+            (bancos['fecha'] <= fecha_pago + pd.DateOffset(months=2)) &
+            (bancos['abonos'].isna())
+        ]
+        match = ventana[ventana['cargos'].round(2) == round(monto_pagado, 2)]
+        if not match.empty:
+            conciliado_egresos.append({
+                'Tipo': 'Egreso',
+                'UUID': uuid,
+                'Fecha Pago': fecha_pago.date(),
+                'Monto Complemento': monto_pagado,
+                'Folio Relacionado': ', '.join(folios),
+                'Nombre Emisor': emisor,
+                'Movimientos Conciliados': len(match),
+                'Monto Conciliado': match['cargos'].sum()
+            })
+
+    df_conc_ingresos = pd.DataFrame(conciliado_ingresos)
+    df_conc_egresos = pd.DataFrame(conciliado_egresos)
+
     output = BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         bancos.to_excel(writer, sheet_name='COMPILADO BANCOS', index=False)
@@ -54,7 +77,8 @@ def procesar_conciliacion_completa(excel_file):
         egresos.to_excel(writer, sheet_name='EGRESOS XML', index=False)
         comp_ingresos.to_excel(writer, sheet_name='COMPLEMENTOS INGRESOS XML', index=False)
         comp_egresos.to_excel(writer, sheet_name='COMPLEMENTOS EGRESOS XML', index=False)
-        df_conciliado.to_excel(writer, sheet_name='CONCILIACION INGRESOS', index=False)
+        df_conc_ingresos.to_excel(writer, sheet_name='CONCILIACION INGRESOS', index=False)
+        df_conc_egresos.to_excel(writer, sheet_name='CONCILIACION EGRESOS', index=False)
 
     output.seek(0)
     return output
