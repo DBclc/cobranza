@@ -1,84 +1,122 @@
 import pandas as pd
 from io import BytesIO
+from itertools import combinations
 
-def procesar_conciliacion_completa(excel_file):
+def buscar_combinaciones(df, columna, objetivo, tolerancia=1.0, max_comb=5):
+    valores = df[columna].round(2).tolist()
+    for r in range(1, min(max_comb, len(valores)) + 1):
+        for combo in combinations(enumerate(valores), r):
+            idxs, nums = zip(*combo)
+            if abs(sum(nums) - objetivo) <= tolerancia:
+                return df.iloc[list(idxs)]
+    return pd.DataFrame()
+
+def ejecutar_conciliacion_completa(excel_file):
     xls = pd.ExcelFile(excel_file)
-
-    bancos = pd.read_excel(xls, sheet_name='COMPILADO BANCOS')
-    ingresos = pd.read_excel(xls, sheet_name='INGRESOS XML')
-    egresos = pd.read_excel(xls, sheet_name='EGRESOS XML')
-    comp_ingresos = pd.read_excel(xls, sheet_name='COMPLEMENTOS INGRESOS XML')
-    comp_egresos = pd.read_excel(xls, sheet_name='COMPLEMENTOS EGRESOS XML')
+    bancos = pd.read_excel(xls, "COMPILADO BANCOS")
+    ingresos = pd.read_excel(xls, "INGRESOS XML")
+    egresos = pd.read_excel(xls, "EGRESOS XML")
+    comp_ing = pd.read_excel(xls, "COMPLEMENTOS INGRESOS XML")
+    comp_egr = pd.read_excel(xls, "COMPLEMENTOS EGRESOS XML")
 
     bancos['fecha'] = pd.to_datetime(bancos['fecha'], errors='coerce')
-    comp_ingresos['FechaPago'] = pd.to_datetime(comp_ingresos['FechaPago'], errors='coerce')
-    comp_egresos['FechaPago'] = pd.to_datetime(comp_egresos['FechaPago'], errors='coerce')
+    ingresos['FechaEmisionXML'] = pd.to_datetime(ingresos['FechaEmisionXML'], errors='coerce')
+    egresos['FechaEmisionXML'] = pd.to_datetime(egresos['FechaEmisionXML'], errors='coerce')
+    comp_ing['FechaPago'] = pd.to_datetime(comp_ing['FechaPago'], errors='coerce')
+    comp_egr['FechaPago'] = pd.to_datetime(comp_egr['FechaPago'], errors='coerce')
 
-    conciliado_ingresos = []
-    conciliado_egresos = []
+    conciliados_ing1, no_conc_ing = [], []
+    conciliados_egr1, no_conc_egr = [], []
 
-    # INGRESOS - Agrupación por UUID
-    for uuid, grupo in comp_ingresos.groupby('UUID'):
-        fecha_pago = grupo['FechaPago'].iloc[0]
-        monto_pagado = grupo['ImpPagado'].sum()
-        folios = grupo['folio relacionado'].dropna().unique()
-        receptor = grupo['Nombre Receptor'].iloc[0]
-
+    # --- FASE 1: Conciliación directa ---
+    for _, row in ingresos.iterrows():
         ventana = bancos[
-            (bancos['fecha'] >= fecha_pago) &
-            (bancos['fecha'] <= fecha_pago + pd.DateOffset(months=2)) &
+            (bancos['fecha'] >= row['FechaEmisionXML']) &
+            (bancos['fecha'] <= row['FechaEmisionXML'] + pd.DateOffset(months=3)) &
             (bancos['cargos'].isna())
         ]
-        match = ventana[ventana['abonos'].round(2) == round(monto_pagado, 2)]
+        match = ventana[abs(ventana['abonos'] - row['Total']) <= 1]
         if not match.empty:
-            conciliado_ingresos.append({
-                'Tipo': 'Ingreso',
-                'UUID': uuid,
-                'Fecha Pago': fecha_pago.date(),
-                'Monto Complemento': monto_pagado,
-                'Folio Relacionado': ', '.join(folios),
-                'Nombre Receptor': receptor,
-                'Movimientos Conciliados': len(match),
-                'Monto Conciliado': match['abonos'].sum()
-            })
+            conciliados_ing1.append(row)
+        else:
+            no_conc_ing.append(row)
 
-    # EGRESOS - Agrupación por UUID
-    for uuid, grupo in comp_egresos.groupby('UUID'):
-        fecha_pago = grupo['FechaPago'].iloc[0]
-        monto_pagado = grupo['ImpPagado'].sum()
-        folios = grupo['FolioRel'].dropna().unique()
-        emisor = grupo['Nombre Emisor'].iloc[0]
-
+    for _, row in egresos.iterrows():
         ventana = bancos[
-            (bancos['fecha'] >= fecha_pago) &
-            (bancos['fecha'] <= fecha_pago + pd.DateOffset(months=2)) &
+            (bancos['fecha'] >= row['FechaEmisionXML']) &
+            (bancos['fecha'] <= row['FechaEmisionXML'] + pd.DateOffset(months=3)) &
             (bancos['abonos'].isna())
         ]
-        match = ventana[ventana['cargos'].round(2) == round(monto_pagado, 2)]
+        match = ventana[abs(ventana['cargos'] - row['Total']) <= 1]
         if not match.empty:
-            conciliado_egresos.append({
-                'Tipo': 'Egreso',
+            conciliados_egr1.append(row)
+        else:
+            no_conc_egr.append(row)
+
+    df_no_conc_ing = pd.DataFrame(no_conc_ing)
+    df_no_conc_egr = pd.DataFrame(no_conc_egr)
+
+    # --- FASE 2: Complementos de ingreso/egreso ---
+    conciliados_ing2, conciliados_egr2 = [], []
+
+    for uuid, grupo in comp_ing.groupby('UUID'):
+        fecha = grupo['FechaPago'].iloc[0]
+        imp = grupo['ImpPagado'].sum()
+        folios = grupo['folio relacionado'].dropna().unique()
+        relacionados = df_no_conc_ing[df_no_conc_ing['Folio'].isin(folios)]
+        if relacionados.empty:
+            continue
+        ventana = bancos[
+            (bancos['fecha'] >= fecha) &
+            (bancos['fecha'] <= fecha + pd.DateOffset(months=3)) &
+            (bancos['cargos'].isna())
+        ]
+        combinacion = buscar_combinaciones(ventana, 'abonos', imp)
+        if not combinacion.empty:
+            conciliados_ing2.append({
                 'UUID': uuid,
-                'Fecha Pago': fecha_pago.date(),
-                'Monto Complemento': monto_pagado,
-                'Folio Relacionado': ', '.join(folios),
-                'Nombre Emisor': emisor,
-                'Movimientos Conciliados': len(match),
-                'Monto Conciliado': match['cargos'].sum()
+                'FechaPago': fecha.date(),
+                'ImpPagado': imp,
+                'Folios': ', '.join(folios)
             })
 
-    df_conc_ingresos = pd.DataFrame(conciliado_ingresos)
-    df_conc_egresos = pd.DataFrame(conciliado_egresos)
+    for uuid, grupo in comp_egr.groupby('UUID'):
+        fecha = grupo['FechaPago'].iloc[0]
+        imp = grupo['ImpPagado'].sum()
+        folios = grupo['FolioRel'].dropna().unique()
+        relacionados = df_no_conc_egr[df_no_conc_egr['Folio'].isin(folios)]
+        if relacionados.empty:
+            continue
+        ventana = bancos[
+            (bancos['fecha'] >= fecha) &
+            (bancos['fecha'] <= fecha + pd.DateOffset(months=3)) &
+            (bancos['abonos'].isna())
+        ]
+        combinacion = buscar_combinaciones(ventana, 'cargos', imp)
+        if not combinacion.empty:
+            conciliados_egr2.append({
+                'UUID': uuid,
+                'FechaPago': fecha.date(),
+                'ImpPagado': imp,
+                'Folios': ', '.join(folios)
+            })
 
+    # Exportar todo a Excel
     output = BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        bancos.to_excel(writer, sheet_name='COMPILADO BANCOS', index=False)
-        ingresos.to_excel(writer, sheet_name='INGRESOS XML', index=False)
-        egresos.to_excel(writer, sheet_name='EGRESOS XML', index=False)
-        comp_ingresos.to_excel(writer, sheet_name='COMPLEMENTOS INGRESOS XML', index=False)
-        comp_egresos.to_excel(writer, sheet_name='COMPLEMENTOS EGRESOS XML', index=False)
-        df_conc_ingresos.to_excel(writer, sheet_name='CONCILIACION INGRESOS', index=False)
-        df_conc_egresos.to_excel(writer, sheet_name='CONCILIACION EGRESOS', index=False)
+        pd.DataFrame(conciliados_ing1).to_excel(writer, "F1 INGRESOS CONCILIADOS", index=False)
+        df_no_conc_ing.to_excel(writer, "F1 INGRESOS NO CONCILIADOS", index=False)
+        pd.DataFrame(conciliados_ing2).to_excel(writer, "F2 INGRESOS COMP CONC", index=False)
+
+        pd.DataFrame(conciliados_egr1).to_excel(writer, "F1 EGRESOS CONCILIADOS", index=False)
+        df_no_conc_egr.to_excel(writer, "F1 EGRESOS NO CONCILIADOS", index=False)
+        pd.DataFrame(conciliados_egr2).to_excel(writer, "F2 EGRESOS COMP CONC", index=False)
+
+        bancos.to_excel(writer, "COMPILADO BANCOS", index=False)
+        ingresos.to_excel(writer, "INGRESOS XML", index=False)
+        egresos.to_excel(writer, "EGRESOS XML", index=False)
+        comp_ing.to_excel(writer, "COMPLEMENTOS INGRESOS XML", index=False)
+        comp_egr.to_excel(writer, "COMPLEMENTOS EGRESOS XML", index=False)
 
     output.seek(0)
     return output
